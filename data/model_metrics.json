@@ -1,0 +1,13 @@
+{
+  "accuracy_test": 0.26552100381887617,
+  "macro_f1_test": 0.21687084090202013,
+  "classes": [
+    "collision",
+    "fall / rollover",
+    "object impact",
+    "other",
+    "pedestrian knockdown"
+  ],
+  "n_train": 81113,
+  "n_test": 36660
+}

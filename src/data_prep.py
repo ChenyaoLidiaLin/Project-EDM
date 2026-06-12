@@ -1,11 +1,11 @@
 """
-Limpieza y preparación de datos de accidentes de tráfico de Madrid (2016-2024)
-con datos de tráfico del sensor más cercano.
+Data cleaning and preparation for Madrid traffic accidents (2016-2024)
+matched with traffic data from the nearest sensor.
 
-Genera:
-  data/accidentes_clean.parquet   -> dataset a nivel de accidente (deduplicado por expediente)
-  data/sensores_riesgo.parquet    -> índice de riesgo por sensor (para el mapa)
-  data/distrito_riesgo_anual.parquet -> índice de riesgo por distrito y año (series temporales)
+Outputs:
+  ../data/accidents_clean.parquet       one row per accident (deduplicated by case number)
+  ../data/sensor_risk.parquet           risk index per sensor (used by the map)
+  ../data/district_risk_yearly.parquet  risk index per district and year (time series)
 """
 
 import csv
@@ -14,15 +14,23 @@ import pandas as pd
 import numpy as np
 from pyproj import Transformer
 
-RAW_PATH = "/mnt/user-data/uploads/accidentes_con_trafico_final__1_.csv"
-OUT_DIR = "/home/claude/project/data"
+RAW_PATH = "../data/accidentes_con_trafico_final.csv"
+OUT_DIR = "../data"
 
-# ---------------------------------------------------------------------------
-# 1. Lectura robusta del CSV (el fichero tiene un sufijo ";;" en cada línea y
-#    algunas filas vienen con todo el registro entre comillas y comillas
-#    internas duplicadas, propio de una doble escritura CSV).
-# ---------------------------------------------------------------------------
+WEATHER_MAP = {
+    "despejado": "clear",
+    "nublado": "cloudy",
+    "lluvia debil": "light rain",
+    "lluvia intensa": "heavy rain",
+    "nevando": "snowing",
+    "granizando": "hailing",
+    "se desconoce": "unknown",
+}
 
+
+# The raw CSV has a trailing ";;" on every line and some rows wrap the entire
+# record in outer quotes with internal double-quote escaping (standard CSV
+# double-write artifact).
 def fix_line(line: str) -> str:
     line = line.rstrip("\r\n")
     if line.endswith(";;"):
@@ -47,10 +55,6 @@ def load_raw() -> pd.DataFrame:
     return df
 
 
-# ---------------------------------------------------------------------------
-# 2. Limpieza de columnas
-# ---------------------------------------------------------------------------
-
 def strip_accents(s):
     if pd.isna(s):
         return s
@@ -58,10 +62,10 @@ def strip_accents(s):
     return "".join(c for c in s if not unicodedata.combining(c))
 
 
-def assign_bloque_horario(hora):
+def assign_time_slot(hora):
     h = pd.to_numeric(hora.str.split(":").str[0], errors="coerce")
-    bins = [-1, 5, 11, 18, 23]
-    labels = ["madrugada (0-5h)", "manana (6-11h)", "tarde (12-18h)", "noche (19-23h)"]
+    bins   = [-1, 5, 11, 18, 23]
+    labels = ["night (0-5h)", "morning (6-11h)", "afternoon (12-18h)", "evening (19-23h)"]
     return pd.cut(h, bins=bins, labels=labels)
 
 
@@ -70,28 +74,29 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     df = df.rename(columns={"estado_meteorológico": "estado_meteorologico"})
 
     num_cols = ["coordenada_x_utm", "coordenada_y_utm", "es_festivo",
-                 "id_sensor_cercano", "intensidad", "ocupacion", "vmed"]
+                "id_sensor_cercano", "intensidad", "ocupacion", "vmed"]
     for c in num_cols:
         df[c] = pd.to_numeric(df[c].replace("", np.nan), errors="coerce")
 
     df["fecha"] = pd.to_datetime(df["fecha"], format="%m/%d/%Y", errors="coerce")
-    df["anio"] = df["fecha"].dt.year
-    df["mes"] = df["fecha"].dt.month
+    df["year"]  = df["fecha"].dt.year
+    df["month"] = df["fecha"].dt.month
 
     text_cols = ["dia_semana", "distrito", "tipo_accidente", "tipo_vehiculo",
-                  "sexo", "rango_edad", "estado_meteorologico"]
+                 "estado_meteorologico"]
     for c in text_cols:
         df[c] = (df[c].astype(str).str.strip().str.lower()
                  .replace({"nan": np.nan, "": np.nan}))
         df[c] = df[c].apply(strip_accents)
 
-    df["rango_edad"] = df["rango_edad"].str.replace("anos", "años", regex=False)
+    df["weather"]   = df["estado_meteorologico"].map(WEATHER_MAP).fillna("unknown")
+    df["time_slot"] = assign_time_slot(df["hora"])
 
-    df["bloque_horario"] = assign_bloque_horario(df["hora"])
-    df["es_finde_festivo"] = (
+    df["is_weekend_holiday"] = (
         (df["es_festivo"] == 1) | df["dia_semana"].isin(["sabado", "domingo"])
     ).astype("Int64")
 
+    # Convert UTM coordinates (ETRS89 zone 30N) to WGS84 lat/lon
     transformer = Transformer.from_crs("EPSG:25830", "EPSG:4326", always_xy=True)
     mask = df["coordenada_x_utm"].notna() & df["coordenada_y_utm"].notna()
     lon, lat = transformer.transform(
@@ -104,95 +109,78 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ---------------------------------------------------------------------------
-# 3. Dataset a nivel de accidente (un registro por expediente)
-# ---------------------------------------------------------------------------
-
 def build_accident_level(df: pd.DataFrame) -> pd.DataFrame:
     df = df[df["num_expediente"].notna() & df["fecha"].notna()]
 
-    n_vehiculos = df.groupby("num_expediente")["tipo_vehiculo"].count()
+    # Count vehicles involved per case before deduplication
+    n_vehicles = df.groupby("num_expediente")["tipo_vehiculo"].count()
     acc = df.drop_duplicates(subset="num_expediente", keep="first").copy()
-    acc["n_vehiculos"] = acc["num_expediente"].map(n_vehiculos)
+    acc["n_vehicles"] = acc["num_expediente"].map(n_vehicles)
 
-    def agrupa_tipo(t):
+    def group_accident_type(t):
         if pd.isna(t):
             return np.nan
         if "atropello" in t:
-            return "atropello"
+            return "pedestrian knockdown"
         if "colision" in t or "alcance" in t:
-            return "colision"
+            return "collision"
         if "caida" in t or "vuelco" in t or "despen" in t:
-            return "caida_vuelco"
+            return "fall / rollover"
         if "choque" in t:
-            return "choque_objeto"
-        return "otros"
+            return "object impact"
+        return "other"
 
-    acc["tipo_accidente_grp"] = acc["tipo_accidente"].apply(agrupa_tipo)
+    acc["accident_type"] = acc["tipo_accidente"].apply(group_accident_type)
 
-    keep = ["fecha", "anio", "mes", "dia_semana", "hora", "bloque_horario",
-            "es_finde_festivo", "distrito", "num_expediente", "tipo_accidente",
-            "tipo_accidente_grp", "tipo_vehiculo", "n_vehiculos",
-            "estado_meteorologico", "lon", "lat",
+    keep = ["fecha", "year", "month", "dia_semana", "hora", "time_slot",
+            "is_weekend_holiday", "distrito", "num_expediente", "tipo_accidente",
+            "accident_type", "tipo_vehiculo", "n_vehicles",
+            "weather", "lon", "lat",
             "id_sensor_cercano", "intensidad", "ocupacion", "vmed"]
     return acc[keep]
 
 
-# ---------------------------------------------------------------------------
-# 4. Proxy de exposicion al trafico por sensor / bloque horario / tipo de dia
-# ---------------------------------------------------------------------------
-
 def build_exposure(df: pd.DataFrame) -> pd.DataFrame:
+    """Traffic exposure proxy: mean flow per sensor, time slot, and day type.
+
+    Since the dataset only contains accident rows (no zero-accident observations),
+    we use the mean historical flow recorded at each sensor/slot/day-type as a
+    proxy for typical traffic volume in that context.
+    """
     base = df[df["intensidad"].notna() & df["id_sensor_cercano"].notna()]
     exposure = (
-        base.groupby(["id_sensor_cercano", "bloque_horario", "es_finde_festivo"],
-                      observed=True)["intensidad"]
+        base.groupby(["id_sensor_cercano", "time_slot", "is_weekend_holiday"],
+                     observed=True)["intensidad"]
         .mean()
         .reset_index()
-        .rename(columns={"intensidad": "exposicion"})
+        .rename(columns={"intensidad": "exposure"})
     )
     return exposure
 
 
-# ---------------------------------------------------------------------------
-# 5. Indice de riesgo: estimador empirico de Bayes (shrinkage tipo Marshall)
-#
-#    El dataset solo contiene filas de accidentes (no hay combinaciones
-#    sensor/franja sin accidente), por lo que un GLM con offset clasico queda
-#    mal calibrado. En su lugar, a cada accidente se le asigna una
-#    "exposicion" = intensidad media historica observada en ese sensor, esa
-#    franja horaria y tipo de dia (proxy del trafico habitual de ese
-#    contexto). La tasa cruda de cada sensor es accidentes / suma de
-#    exposiciones. Esa tasa es muy inestable cuando hay pocos accidentes, asi
-#    que se aplica un encogimiento empirico de Bayes (Marshall, 1991) hacia
-#    la media global, con un peso proporcional a la exposicion acumulada.
-# ---------------------------------------------------------------------------
-
 def _attach_exposure_per_accident(acc: pd.DataFrame, exposure: pd.DataFrame) -> pd.DataFrame:
     out = acc.merge(
-        exposure, on=["id_sensor_cercano", "bloque_horario", "es_finde_festivo"], how="left"
+        exposure, on=["id_sensor_cercano", "time_slot", "is_weekend_holiday"], how="left"
     )
-    return out[out["exposicion"] > 0]
+    return out[out["exposure"] > 0]
 
 
-def _empirical_bayes_index(n_acc: np.ndarray, exposicion: np.ndarray):
-    """Tasa encogida (empirical Bayes) e indice de riesgo (tasa encogida /
-    tasa global).
+def _empirical_bayes_index(n_acc: np.ndarray, exposure: np.ndarray):
+    """Compute shrunk accident rates and risk indices using empirical Bayes.
 
-    E_i = m * exposicion_i es el numero de accidentes esperado en la unidad i
-    si tuviera la tasa global m. Se usa como pseudo-conteo de confianza un
-    valor k igual a la mediana de E_i: unidades con E_i << k (poca exposicion
-    acumulada, estimacion poco fiable) se acercan a la tasa global, y
-    unidades con E_i >> k conservan su tasa observada.
+    For each unit i, E_i = m * exposure_i is the expected accident count under
+    the city-wide rate m. We use k = median(E_i) as the prior weight: units with
+    low exposure shrink toward the global rate, while well-observed units keep
+    their own rate. Method follows Marshall (1991).
     """
-    m = n_acc.sum() / exposicion.sum()          # tasa global
-    crude = n_acc / exposicion                   # tasa cruda por unidad
-    E = m * exposicion                           # accidentes esperados bajo la tasa global
-    k = np.median(E)
-    w = E / (E + k)
+    m      = n_acc.sum() / exposure.sum()   # city-wide accident rate
+    crude  = n_acc / exposure               # raw rate per unit
+    E      = m * exposure                   # expected accidents under global rate
+    k      = np.median(E)                   # prior strength (median expected count)
+    w      = E / (E + k)                    # shrinkage weight
     shrunk = w * crude + (1 - w) * m
-    indice = shrunk / m
-    return shrunk, indice, m, k
+    index  = shrunk / m                     # risk index (1 = city average)
+    return shrunk, index, m, k
 
 
 def build_sensor_risk(acc: pd.DataFrame, exposure: pd.DataFrame):
@@ -200,80 +188,75 @@ def build_sensor_risk(acc: pd.DataFrame, exposure: pd.DataFrame):
 
     sensor_data = (
         df.groupby("id_sensor_cercano")
-        .agg(n_accidentes=("num_expediente", "count"), exposicion=("exposicion", "sum"))
+        .agg(n_accidents=("num_expediente", "count"), exposure=("exposure", "sum"))
         .reset_index()
     )
 
-    shrunk, indice, m, k = _empirical_bayes_index(
-        sensor_data["n_accidentes"].values, sensor_data["exposicion"].values
+    shrunk, index, m, k = _empirical_bayes_index(
+        sensor_data["n_accidents"].values, sensor_data["exposure"].values
     )
-    sensor_data["tasa_encogida"] = shrunk
-    sensor_data["indice_riesgo"] = indice
+    sensor_data["shrunk_rate"] = shrunk
+    sensor_data["risk_index"]  = index
 
     coords = acc.groupby("id_sensor_cercano").agg(
-        lon=("lon", "mean"), lat=("lat", "mean"), distrito=("distrito", "first")
+        lon=("lon", "mean"), lat=("lat", "mean"), district=("distrito", "first")
     ).reset_index()
     sensor_data = sensor_data.merge(coords, on="id_sensor_cercano", how="left")
     return sensor_data, m, k
 
 
-# ---------------------------------------------------------------------------
-# 6. Evolucion temporal del indice de riesgo por distrito y año
-#    (se usan la tasa global m y el pseudo-conteo k de todo el periodo para
-#    que los indices de distintos años sean comparables entre si)
-# ---------------------------------------------------------------------------
-
 def build_district_yearly(acc: pd.DataFrame, exposure: pd.DataFrame, m: float, k: float) -> pd.DataFrame:
+    """Year-by-year risk index per district.
+
+    We reuse the global m and k from the full period so that indices remain
+    comparable across years.
+    """
     df = _attach_exposure_per_accident(
         acc[acc["id_sensor_cercano"].notna() & acc["distrito"].notna()], exposure
     )
 
     out = (
-        df.groupby(["distrito", "anio"])
-        .agg(n_accidentes=("num_expediente", "count"), exposicion=("exposicion", "sum"))
+        df.groupby(["distrito", "year"])
+        .agg(n_accidents=("num_expediente", "count"), exposure=("exposure", "sum"))
         .reset_index()
     )
 
-    crude = out["n_accidentes"] / out["exposicion"]
-    E = m * out["exposicion"]
-    w = E / (E + k)
-    out["tasa_encogida"] = w * crude + (1 - w) * m
-    out["indice_riesgo"] = out["tasa_encogida"] / m
+    crude  = out["n_accidents"] / out["exposure"]
+    E      = m * out["exposure"]
+    w      = E / (E + k)
+    out["shrunk_rate"] = w * crude + (1 - w) * m
+    out["risk_index"]  = out["shrunk_rate"] / m
     return out
 
-
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import os
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    print("Cargando y limpiando datos crudos...")
+    print("Loading and cleaning raw data...")
     raw = load_raw()
-    print(f"  filas leidas correctamente: {len(raw)}")
+    print(f"  rows parsed successfully: {len(raw)}")
 
     df = clean(raw)
 
-    print("Construyendo dataset a nivel de accidente...")
+    print("Building accident-level dataset...")
     acc = build_accident_level(df)
-    print(f"  accidentes (expedientes unicos): {len(acc)}")
-    acc.to_parquet(f"{OUT_DIR}/accidentes_clean.parquet", index=False)
+    print(f"  unique accidents (case numbers): {len(acc)}")
+    acc.to_parquet(f"{OUT_DIR}/accidents_clean.parquet", index=False)
 
-    print("Calculando exposicion proxy al trafico...")
+    print("Computing traffic exposure proxy...")
     exposure = build_exposure(df)
-    print(f"  combinaciones sensor/franja/finde: {len(exposure)}")
+    print(f"  sensor / slot / day-type combinations: {len(exposure)}")
 
-    print("Calculando indice de riesgo por sensor (empirical Bayes)...")
-    sensor_risk, tasa_global, k = build_sensor_risk(acc, exposure)
-    print(f"  tasa global: {tasa_global:.6f}  |  k: {k:.3f}  |  sensores: {len(sensor_risk)}")
-    print(sensor_risk["indice_riesgo"].describe())
-    sensor_risk.to_parquet(f"{OUT_DIR}/sensores_riesgo.parquet", index=False)
+    print("Computing sensor risk index (empirical Bayes)...")
+    sensor_risk, global_rate, k = build_sensor_risk(acc, exposure)
+    print(f"  global rate: {global_rate:.6f}  |  k: {k:.3f}  |  sensors: {len(sensor_risk)}")
+    print(sensor_risk["risk_index"].describe())
+    sensor_risk.to_parquet(f"{OUT_DIR}/sensor_risk.parquet", index=False)
 
-    print("Calculando evolucion temporal por distrito...")
-    dist_year = build_district_yearly(acc, exposure, tasa_global, k)
-    dist_year.to_parquet(f"{OUT_DIR}/distrito_riesgo_anual.parquet", index=False)
-    print(f"  filas distrito-año: {len(dist_year)}")
+    print("Computing yearly district trends...")
+    dist_year = build_district_yearly(acc, exposure, global_rate, k)
+    dist_year.to_parquet(f"{OUT_DIR}/district_risk_yearly.parquet", index=False)
+    print(f"  district-year rows: {len(dist_year)}")
 
-    print("Listo.")
+    print("Done.")

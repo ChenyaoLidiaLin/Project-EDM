@@ -1,18 +1,17 @@
 """
-Modelo predictivo: dado el contexto de trafico, meteorologia, hora y zona,
-estima la probabilidad de que ocurra un accidente y el tipo mas probable.
+Predictive model: given traffic conditions, weather, time of day, and district,
+estimates the most likely accident type.
 
-Validacion temporal: entrena con accidentes hasta 2022 y evalua con 2023-2024,
-para evitar fugas de informacion entre periodos.
+Temporal validation: trains on accidents up to 2022 and evaluates on 2023-2024
+to avoid any information leakage between periods.
 
-Genera:
-  data/modelo_tipo_accidente.joblib
-  data/feature_importance.parquet
-  data/metricas_modelo.json
+Outputs:
+  ../data/accident_type_model.joblib
+  ../data/feature_importance.parquet
+  ../data/model_metrics.json
 """
 
 import json
-import numpy as np
 import pandas as pd
 import joblib
 from sklearn.ensemble import RandomForestClassifier
@@ -22,24 +21,25 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.inspection import permutation_importance
 
-DATA_DIR = "/home/claude/project/data"
+DATA_DIR = "../data"
 
-NUM_FEATURES = ["intensidad", "ocupacion", "vmed", "mes"]
-CAT_FEATURES = ["estado_meteorologico", "bloque_horario", "es_finde_festivo", "distrito"]
-TARGET = "tipo_accidente_grp"
+NUM_FEATURES = ["intensidad", "ocupacion", "vmed", "month"]
+CAT_FEATURES = ["weather", "time_slot", "is_weekend_holiday", "distrito"]
+TARGET = "accident_type"
 
 
 def main():
-    acc = pd.read_parquet(f"{DATA_DIR}/accidentes_clean.parquet")
+    acc = pd.read_parquet(f"{DATA_DIR}/accidents_clean.parquet")
 
     df = acc.dropna(subset=NUM_FEATURES + CAT_FEATURES + [TARGET]).copy()
-    df["es_finde_festivo"] = df["es_finde_festivo"].astype(str)
+    df["is_weekend_holiday"] = df["is_weekend_holiday"].astype(str)
 
-    train = df[df["anio"] <= 2022]
-    test = df[df["anio"] > 2022]
+    # Temporal split: train on 2016-2022, test on 2023-2024
+    train = df[df["year"] <= 2022]
+    test  = df[df["year"] > 2022]
 
     X_train, y_train = train[NUM_FEATURES + CAT_FEATURES], train[TARGET]
-    X_test, y_test = test[NUM_FEATURES + CAT_FEATURES], test[TARGET]
+    X_test,  y_test  = test[NUM_FEATURES + CAT_FEATURES],  test[TARGET]
 
     preprocess = ColumnTransformer([
         ("num", "passthrough", NUM_FEATURES),
@@ -54,36 +54,47 @@ def main():
         )),
     ])
 
-    print("Entrenando modelo (train: hasta 2022, test: 2023-2024)...")
+    print("Training model (train: up to 2022, test: 2023-2024)...")
     pipe.fit(X_train, y_train)
 
     y_pred = pipe.predict(X_test)
     report = classification_report(y_test, y_pred, output_dict=True)
     print(classification_report(y_test, y_pred))
 
-    print("Calculando importancia de variables (permutation importance)...")
+    print("Computing feature importance (permutation-based)...")
     pi = permutation_importance(
         pipe, X_test, y_test, n_repeats=5, random_state=42, n_jobs=-1
     )
+
+    FEATURE_LABELS = {
+        "intensidad":          "traffic flow",
+        "ocupacion":           "occupancy",
+        "vmed":                "mean speed",
+        "weather":             "weather",
+        "time_slot":           "time slot",
+        "is_weekend_holiday":  "weekend / holiday",
+        "distrito":            "district",
+    }
+
     importance = pd.DataFrame({
-        "variable": NUM_FEATURES + CAT_FEATURES,
-        "importancia": pi.importances_mean,
-    }).sort_values("importancia", ascending=False)
+        "feature": [FEATURE_LABELS.get(f, f) for f in NUM_FEATURES + CAT_FEATURES],
+        "importance": pi.importances_mean,
+    }).sort_values("importance", ascending=False)
     print(importance)
 
-    joblib.dump(pipe, f"{DATA_DIR}/modelo_tipo_accidente.joblib")
+    joblib.dump(pipe, f"{DATA_DIR}/accident_type_model.joblib")
     importance.to_parquet(f"{DATA_DIR}/feature_importance.parquet", index=False)
 
-    with open(f"{DATA_DIR}/metricas_modelo.json", "w") as f:
+    with open(f"{DATA_DIR}/model_metrics.json", "w") as f:
         json.dump({
-            "accuracy_test": report["accuracy"],
-            "macro_f1_test": report["macro avg"]["f1-score"],
-            "clases": sorted(y_train.unique().tolist()),
-            "n_train": len(train),
-            "n_test": len(test),
+            "accuracy_test":  report["accuracy"],
+            "macro_f1_test":  report["macro avg"]["f1-score"],
+            "classes":        sorted(y_train.unique().tolist()),
+            "n_train":        len(train),
+            "n_test":         len(test),
         }, f, indent=2)
 
-    print("Listo.")
+    print("Done.")
 
 
 if __name__ == "__main__":
