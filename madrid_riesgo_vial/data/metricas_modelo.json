@@ -1,0 +1,13 @@
+{
+  "accuracy_test": 0.30871312420173824,
+  "macro_f1_test": 0.23011381271799283,
+  "clases": [
+    "atropello",
+    "caida_vuelco",
+    "choque_objeto",
+    "colision",
+    "otros"
+  ],
+  "n_train": 76321,
+  "n_test": 32101
+}
