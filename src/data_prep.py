@@ -82,6 +82,9 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     df["year"]  = df["fecha"].dt.year
     df["month"] = df["fecha"].dt.month
 
+    # Extract hour as a continuous numeric feature
+    df["hour"] = pd.to_numeric(df["hora"].str.split(":").str[0], errors="coerce")
+
     text_cols = ["dia_semana", "distrito", "tipo_accidente", "tipo_vehiculo",
                  "estado_meteorologico"]
     for c in text_cols:
@@ -95,6 +98,10 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     df["is_weekend_holiday"] = (
         (df["es_festivo"] == 1) | df["dia_semana"].isin(["sabado", "domingo"])
     ).astype("Int64")
+
+    # vmed=0 and intensidad=0 are sensor artifacts (no reading), not real zeros
+    df["vmed"]       = df["vmed"].replace(0, np.nan)
+    df["intensidad"] = df["intensidad"].replace(0, np.nan)
 
     # Convert UTM coordinates (ETRS89 zone 30N) to WGS84 lat/lon
     transformer = Transformer.from_crs("EPSG:25830", "EPSG:4326", always_xy=True)
@@ -132,7 +139,7 @@ def build_accident_level(df: pd.DataFrame) -> pd.DataFrame:
 
     acc["accident_type"] = acc["tipo_accidente"].apply(group_accident_type)
 
-    keep = ["fecha", "year", "month", "dia_semana", "hora", "time_slot",
+    keep = ["fecha", "year", "month", "hour", "dia_semana", "hora", "time_slot",
             "is_weekend_holiday", "distrito", "num_expediente", "tipo_accidente",
             "accident_type", "tipo_vehiculo", "n_vehicles",
             "weather", "lon", "lat",
