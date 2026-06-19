@@ -243,6 +243,78 @@ def build_district_yearly(acc: pd.DataFrame, exposure: pd.DataFrame, m: float, k
     return out
 
 
+def build_travel_risk(acc: pd.DataFrame) -> pd.DataFrame:
+    """Accident counts and empirical Bayes risk index per district / travel
+    mode / time slot / weather combination.
+
+    Travel mode is inferred from vehicle type and accident type:
+    - pedestrian knockdown accidents are assigned to the 'pedestrian' mode
+      regardless of the vehicle column (which records the striking vehicle).
+    - All other rows use the vehicle type of the first vehicle in the case.
+
+    The shrinkage is applied within each (district, travel_mode) pair so that
+    the reference rate is that mode's own typical rate in that district, not
+    the city-wide rate. This answers the practical question: given that I am
+    travelling by mode X in district Y, when is it more dangerous than usual?
+    """
+
+    def _travel_type(row):
+        a = row["accident_type"]
+        v = str(row["tipo_vehiculo"]) if pd.notna(row["tipo_vehiculo"]) else ""
+        if a == "pedestrian knockdown":
+            return "pedestrian"
+        if "motocicleta" in v or "ciclomotor" in v:
+            return "motorcycle"
+        if "bicicleta" in v or "vmu" in v:
+            return "bike / e-scooter"
+        if "turismo" in v or "todo terreno" in v:
+            return "car"
+        if "autobus" in v or "autocar" in v:
+            return "bus"
+        if "camion" in v or "furgon" in v or "tractocamion" in v:
+            return "truck / van"
+        return None
+
+    acc = acc.copy()
+    acc["travel_type"] = acc.apply(_travel_type, axis=1)
+
+    grp = (
+        acc.dropna(subset=["distrito", "travel_type", "time_slot", "weather"])
+        .groupby(["distrito", "travel_type", "time_slot", "weather"], observed=True)
+        .size()
+        .reset_index(name="n_accidents")
+    )
+
+    def _eb_within_group(sub: pd.DataFrame) -> pd.DataFrame:
+        """Shrink each cell toward the group mean (district × travel_type)."""
+        m = sub["n_accidents"].mean()
+        if m <= 0:
+            sub = sub.copy()
+            sub["risk_index"] = 1.0
+            return sub
+        k = max(m, 1.0)          # pseudo-count = group mean (conservative prior)
+        w = m / (m + k)          # shrinkage weight
+        sub = sub.copy()
+        shrunk = w * sub["n_accidents"] + (1 - w) * m
+        sub["risk_index"] = shrunk / m
+        return sub
+
+    results = []
+    for (distrito, travel_type), sub in grp.groupby(
+        ["distrito", "travel_type"], observed=True
+    ):
+        processed = _eb_within_group(sub)
+        processed = processed.copy()
+        processed["distrito"]    = distrito
+        processed["travel_type"] = travel_type
+        results.append(processed)
+
+    out = pd.concat(results, ignore_index=True)[
+        ["distrito", "travel_type", "time_slot", "weather", "n_accidents", "risk_index"]
+    ]
+    return out
+
+
 if __name__ == "__main__":
     import os
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -272,5 +344,10 @@ if __name__ == "__main__":
     dist_year = build_district_yearly(acc, exposure, global_rate, k)
     dist_year.to_parquet(f"{OUT_DIR}/district_risk_yearly.parquet", index=False)
     print(f"  district-year rows: {len(dist_year)}")
+
+    print("Computing travel risk by mode, time slot and weather...")
+    travel_risk = build_travel_risk(acc)
+    travel_risk.to_parquet(f"{OUT_DIR}/travel_risk.parquet", index=False)
+    print(f"  travel-risk rows: {len(travel_risk)}")
 
     print("Done.")
