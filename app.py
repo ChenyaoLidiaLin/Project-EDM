@@ -117,7 +117,7 @@ with tab2:
     with c1:
         vehicle_cat = st.selectbox("Vehicle type",
                                    ["car", "motorcycle", "truck", "bike", "bus", "other"])
-        n_vehicles  = st.slider("Vehicles involved", 1, 8, 2)
+        vehicle_count_type = st.radio("Vehicles involved", ["Single vehicle", "Multiple vehicles"])
         hour        = st.slider("Hour of day", 0, 23, 12)
         month       = st.slider("Month", 1, 12, 6)
     with c2:
@@ -130,7 +130,7 @@ with tab2:
                                    ["monday", "tuesday", "wednesday", "thursday",
                                     "friday", "saturday", "sunday"])
 
-    single_vehicle = "single" if n_vehicles == 1 else "multiple"
+    single_vehicle = "single" if vehicle_count_type == "Single vehicle" else "multiple"
 
     X = pd.DataFrame([{
         "hour":           hour,
