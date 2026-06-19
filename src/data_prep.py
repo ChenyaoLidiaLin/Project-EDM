@@ -92,12 +92,19 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
                  .replace({"nan": np.nan, "": np.nan}))
         df[c] = df[c].apply(strip_accents)
 
+    DAY_MAP = {
+        "lunes":     "monday",
+        "martes":    "tuesday",
+        "miercoles": "wednesday",
+        "jueves":    "thursday",
+        "viernes":   "friday",
+        "sabado":    "saturday",
+        "domingo":   "sunday",
+    }
+    df["day_of_week"] = df["dia_semana"].map(DAY_MAP).fillna("unknown")
+
     df["weather"]   = df["estado_meteorologico"].map(WEATHER_MAP).fillna("unknown")
     df["time_slot"] = assign_time_slot(df["hora"])
-
-    df["is_weekend_holiday"] = (
-        (df["es_festivo"] == 1) | df["dia_semana"].isin(["sabado", "domingo"])
-    ).astype("Int64")
 
     # vmed=0 and intensidad=0 are sensor artifacts (no reading), not real zeros
     df["vmed"]       = df["vmed"].replace(0, np.nan)
@@ -139,8 +146,8 @@ def build_accident_level(df: pd.DataFrame) -> pd.DataFrame:
 
     acc["accident_type"] = acc["tipo_accidente"].apply(group_accident_type)
 
-    keep = ["fecha", "year", "month", "hour", "dia_semana", "hora", "time_slot",
-            "is_weekend_holiday", "distrito", "num_expediente", "tipo_accidente",
+    keep = ["fecha", "year", "month", "hour", "day_of_week", "hora", "time_slot",
+            "distrito", "num_expediente", "tipo_accidente",
             "accident_type", "tipo_vehiculo", "n_vehicles",
             "weather", "lon", "lat",
             "id_sensor_cercano", "intensidad", "ocupacion", "vmed"]
@@ -154,9 +161,9 @@ def build_exposure(df: pd.DataFrame) -> pd.DataFrame:
     we use the mean historical flow recorded at each sensor/slot/day-type as a
     proxy for typical traffic volume in that context.
     """
-    base = df[df["intensidad"].notna() & df["id_sensor_cercano"].notna()]
+    base = df[df["intensidad"].notna() & df["id_sensor_cercano"].notna() & df["day_of_week"].notna()]
     exposure = (
-        base.groupby(["id_sensor_cercano", "time_slot", "is_weekend_holiday"],
+        base.groupby(["id_sensor_cercano", "time_slot", "day_of_week"],
                      observed=True)["intensidad"]
         .mean()
         .reset_index()
@@ -167,7 +174,7 @@ def build_exposure(df: pd.DataFrame) -> pd.DataFrame:
 
 def _attach_exposure_per_accident(acc: pd.DataFrame, exposure: pd.DataFrame) -> pd.DataFrame:
     out = acc.merge(
-        exposure, on=["id_sensor_cercano", "time_slot", "is_weekend_holiday"], how="left"
+        exposure, on=["id_sensor_cercano", "time_slot", "day_of_week"], how="left"
     )
     return out[out["exposure"] > 0]
 
@@ -219,7 +226,7 @@ def build_district_yearly(acc: pd.DataFrame, exposure: pd.DataFrame, m: float, k
     comparable across years.
     """
     df = _attach_exposure_per_accident(
-        acc[acc["id_sensor_cercano"].notna() & acc["distrito"].notna()], exposure
+        acc[acc["id_sensor_cercano"].notna() & acc["distrito"].notna() & acc["day_of_week"].notna()], exposure
     )
 
     out = (

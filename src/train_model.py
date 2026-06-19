@@ -25,8 +25,8 @@ from sklearn.utils.class_weight import compute_sample_weight
 
 DATA_DIR = "../data"
 
-NUM_FEATURES = ["n_vehicles", "hour", "month"]
-CAT_FEATURES = ["vehicle_cat", "weather", "is_weekend_holiday", "distrito"]
+NUM_FEATURES = ["hour", "month"]
+CAT_FEATURES = ["single_vehicle", "vehicle_cat", "weather", "day_of_week", "distrito"]
 TARGET = "accident_type"
 
 
@@ -47,6 +47,11 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 
     df["vehicle_cat"] = df["tipo_vehiculo"].apply(vehicle_cat)
 
+    # Create binary indicator: single vehicle vs multiple vehicles
+    df["single_vehicle"] = df["n_vehicles"].apply(
+        lambda x: "single" if x == 1 else "multiple" if pd.notna(x) else "unknown"
+    )
+
     return df
 
 
@@ -55,7 +60,6 @@ def main():
     acc = engineer_features(acc)
 
     df = acc.dropna(subset=CAT_FEATURES + [TARGET]).copy()
-    df["is_weekend_holiday"] = df["is_weekend_holiday"].astype(str)
 
     # Temporal split: train on 2016-2022, test on 2023-2024
     train = df[df["year"] <= 2022]
@@ -94,13 +98,13 @@ def main():
     )
 
     FEATURE_LABELS = {
-        "n_vehicles":         "vehicles involved",
-        "hour":               "hour of day",
-        "month":              "month",
-        "vehicle_cat":        "vehicle type",
-        "weather":            "weather",
-        "is_weekend_holiday": "weekend / holiday",
-        "distrito":           "district",
+        "single_vehicle": "single vehicle",
+        "hour": "hour of day",
+        "month": "month",
+        "vehicle_cat": "vehicle type",
+        "weather": "weather",
+        "day_of_week": "day of week",
+        "distrito": "district",
     }
 
     importance = pd.DataFrame({

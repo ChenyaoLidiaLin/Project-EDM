@@ -1,6 +1,6 @@
 {
-  "accuracy_test": 0.5938814993954051,
-  "macro_f1_test": 0.42294728646093915,
+  "accuracy_test": 0.6687545344619105,
+  "macro_f1_test": 0.44304172457712665,
   "classes": [
     "collision",
     "fall / rollover",
