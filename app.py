@@ -122,21 +122,24 @@ with tab2:
         month       = st.slider("Month", 1, 12, 6)
     with c2:
         acc = load_accidents()
-        district   = st.selectbox("District", sorted(acc["distrito"].dropna().unique()))
-        weather    = st.selectbox("Weather",
-                                  ["clear", "cloudy", "light rain", "heavy rain",
-                                   "snowing", "hailing", "unknown"])
-        day_type   = st.radio("Day type", ["Weekday", "Weekend / public holiday"])
-        is_weekend = "1" if day_type == "Weekend / public holiday" else "0"
+        district    = st.selectbox("District", sorted(acc["distrito"].dropna().unique()))
+        weather     = st.selectbox("Weather",
+                                   ["clear", "cloudy", "light rain", "heavy rain",
+                                    "snowing", "hailing", "unknown"])
+        day_of_week = st.selectbox("Day of week",
+                                   ["monday", "tuesday", "wednesday", "thursday",
+                                    "friday", "saturday", "sunday"])
+
+    single_vehicle = "single" if n_vehicles == 1 else "multiple"
 
     X = pd.DataFrame([{
-        "n_vehicles":         n_vehicles,
-        "hour":               hour,
-        "month":              month,
-        "vehicle_cat":        vehicle_cat,
-        "weather":            weather,
-        "is_weekend_holiday": is_weekend,
-        "distrito":           district,
+        "hour":           hour,
+        "month":          month,
+        "single_vehicle": single_vehicle,
+        "vehicle_cat":    vehicle_cat,
+        "weather":        weather,
+        "day_of_week":    day_of_week,
+        "distrito":       district,
     }])
 
     proba    = pipe.predict_proba(X)[0]
