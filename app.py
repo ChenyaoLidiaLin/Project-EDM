@@ -122,7 +122,7 @@ def compute_default_districts(sensors_df: pd.DataFrame,
 st.title("Madrid Road Risk: accident rates normalized by traffic volume")
 st.markdown(
     "Analysis of Madrid traffic accidents (2016–2024) matched with data from the nearest "
-    "traffic sensors (flow, occupancy, mean speed). The goal is to find locations where "
+    "traffic sensors. The goal is to find locations where "
     "**more accidents happen than the local traffic volume would predict**, not just the "
     "spots with the highest raw accident count."
 )
