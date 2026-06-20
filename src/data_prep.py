@@ -82,6 +82,9 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     df["year"]  = df["fecha"].dt.year
     df["month"] = df["fecha"].dt.month
 
+    # Extract hour as a continuous numeric feature
+    df["hour"] = pd.to_numeric(df["hora"].str.split(":").str[0], errors="coerce")
+
     text_cols = ["dia_semana", "distrito", "tipo_accidente", "tipo_vehiculo",
                  "estado_meteorologico"]
     for c in text_cols:
@@ -89,12 +92,23 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
                  .replace({"nan": np.nan, "": np.nan}))
         df[c] = df[c].apply(strip_accents)
 
+    DAY_MAP = {
+        "lunes":     "monday",
+        "martes":    "tuesday",
+        "miercoles": "wednesday",
+        "jueves":    "thursday",
+        "viernes":   "friday",
+        "sabado":    "saturday",
+        "domingo":   "sunday",
+    }
+    df["day_of_week"] = df["dia_semana"].map(DAY_MAP).fillna("unknown")
+
     df["weather"]   = df["estado_meteorologico"].map(WEATHER_MAP).fillna("unknown")
     df["time_slot"] = assign_time_slot(df["hora"])
 
-    df["is_weekend_holiday"] = (
-        (df["es_festivo"] == 1) | df["dia_semana"].isin(["sabado", "domingo"])
-    ).astype("Int64")
+    # vmed=0 and intensidad=0 are sensor artifacts (no reading), not real zeros
+    df["vmed"]       = df["vmed"].replace(0, np.nan)
+    df["intensidad"] = df["intensidad"].replace(0, np.nan)
 
     # Convert UTM coordinates (ETRS89 zone 30N) to WGS84 lat/lon
     transformer = Transformer.from_crs("EPSG:25830", "EPSG:4326", always_xy=True)
@@ -132,8 +146,8 @@ def build_accident_level(df: pd.DataFrame) -> pd.DataFrame:
 
     acc["accident_type"] = acc["tipo_accidente"].apply(group_accident_type)
 
-    keep = ["fecha", "year", "month", "dia_semana", "hora", "time_slot",
-            "is_weekend_holiday", "distrito", "num_expediente", "tipo_accidente",
+    keep = ["fecha", "year", "month", "hour", "day_of_week", "hora", "time_slot",
+            "distrito", "num_expediente", "tipo_accidente",
             "accident_type", "tipo_vehiculo", "n_vehicles",
             "weather", "lon", "lat",
             "id_sensor_cercano", "intensidad", "ocupacion", "vmed"]
@@ -147,9 +161,9 @@ def build_exposure(df: pd.DataFrame) -> pd.DataFrame:
     we use the mean historical flow recorded at each sensor/slot/day-type as a
     proxy for typical traffic volume in that context.
     """
-    base = df[df["intensidad"].notna() & df["id_sensor_cercano"].notna()]
+    base = df[df["intensidad"].notna() & df["id_sensor_cercano"].notna() & df["day_of_week"].notna()]
     exposure = (
-        base.groupby(["id_sensor_cercano", "time_slot", "is_weekend_holiday"],
+        base.groupby(["id_sensor_cercano", "time_slot", "day_of_week"],
                      observed=True)["intensidad"]
         .mean()
         .reset_index()
@@ -160,7 +174,7 @@ def build_exposure(df: pd.DataFrame) -> pd.DataFrame:
 
 def _attach_exposure_per_accident(acc: pd.DataFrame, exposure: pd.DataFrame) -> pd.DataFrame:
     out = acc.merge(
-        exposure, on=["id_sensor_cercano", "time_slot", "is_weekend_holiday"], how="left"
+        exposure, on=["id_sensor_cercano", "time_slot", "day_of_week"], how="left"
     )
     return out[out["exposure"] > 0]
 
@@ -212,7 +226,7 @@ def build_district_yearly(acc: pd.DataFrame, exposure: pd.DataFrame, m: float, k
     comparable across years.
     """
     df = _attach_exposure_per_accident(
-        acc[acc["id_sensor_cercano"].notna() & acc["distrito"].notna()], exposure
+        acc[acc["id_sensor_cercano"].notna() & acc["distrito"].notna() & acc["day_of_week"].notna()], exposure
     )
 
     out = (
@@ -227,6 +241,122 @@ def build_district_yearly(acc: pd.DataFrame, exposure: pd.DataFrame, m: float, k
     out["shrunk_rate"] = w * crude + (1 - w) * m
     out["risk_index"]  = out["shrunk_rate"] / m
     return out
+
+
+def build_travel_risk(acc: pd.DataFrame, exposure: pd.DataFrame) -> pd.DataFrame:
+    """Accident rate per district / travel mode / time slot / weather combination,
+    normalized by district-level traffic exposure (same methodology as the sensor
+    risk map and district yearly trends).
+
+    WHY exposure matters here
+    -------------------------
+    The previous version divided accidents by the mean accident count, so the
+    denominator was still an accident-derived number.  That tells you "when do
+    more accidents happen?", not "when do accidents happen more than traffic
+    volume would predict?".  Using the sensor flow as denominator captures the
+    second, harder question: e.g. fewer cars drive in heavy rain, so a raw
+    count of 3 accidents at 3 am in a storm is far more alarming than 3
+    accidents on a clear Friday afternoon.
+
+    HOW the denominator is built
+    ----------------------------
+    The `exposure` table has one row per (sensor, time_slot, day_of_week) with
+    the mean historical intensidad (veh/h) for that combination.  Each sensor
+    is mapped to the district it belongs to (using the first district label in
+    the accident table).  We then sum over sensors and average over day-of-week
+    to get a single exposure figure per (district, time_slot) — representing
+    the typical total traffic volume in that part of the city during that part
+    of the day.  Weather is *not* used as a grouping key for the denominator:
+    we want to capture "accidents per unit of traffic despite the rain", not
+    "accidents per unit of rainy-day traffic" (which would cancel out the
+    reduced traffic and understate the real risk).
+
+    EMPIRICAL BAYES SHRINKAGE
+    -------------------------
+    Applied within each (district, travel_type) pair, exactly as in
+    _empirical_bayes_index(): each (time_slot, weather) cell is shrunk toward
+    the pair's own mean rate.  Cells with very few accidents converge to 1.0;
+    well-observed cells keep their own estimated rate.
+    """
+
+    # ── 1. Map sensor → district; aggregate exposure to district × time_slot ──
+    sensor_to_district = (
+        acc.dropna(subset=["id_sensor_cercano", "distrito"])
+        .groupby("id_sensor_cercano")["distrito"].first()
+    )
+    exp = exposure.copy()
+    exp["distrito"] = exp["id_sensor_cercano"].map(sensor_to_district)
+    # Sum over sensors in the same district; average over day-of-week so that
+    # a district with 5 sensors doesn't look 5× busier than one with 1.
+    exp_district = (
+        exp.dropna(subset=["distrito"])
+        .groupby(["distrito", "time_slot", "day_of_week"], observed=True)["exposure"]
+        .sum()
+        .reset_index()
+        .groupby(["distrito", "time_slot"], observed=True)["exposure"]
+        .mean()
+        .reset_index()
+    )
+
+    # ── 2. Classify travel / road-user type ──────────────────────────────────
+    def _travel_type(row):
+        a = row["accident_type"]
+        v = str(row["tipo_vehiculo"]) if pd.notna(row["tipo_vehiculo"]) else ""
+        if a == "pedestrian knockdown":
+            return "pedestrian"
+        if "motocicleta" in v or "ciclomotor" in v:
+            return "motorcycle"
+        if "bicicleta" in v or "vmu" in v:
+            return "bike / e-scooter"
+        if "turismo" in v or "todo terreno" in v:
+            return "car"
+        if "autobus" in v or "autocar" in v:
+            return "bus"
+        if "camion" in v or "furgon" in v or "tractocamion" in v:
+            return "truck / van"
+        return None
+
+    acc = acc.copy()
+    acc["travel_type"] = acc.apply(_travel_type, axis=1)
+
+    # ── 3. Count accidents per (district × travel_type × time_slot × weather) ─
+    grp = (
+        acc.dropna(subset=["distrito", "travel_type", "time_slot", "weather"])
+        .groupby(["distrito", "travel_type", "time_slot", "weather"], observed=True)
+        .size()
+        .reset_index(name="n_accidents")
+    )
+
+    # ── 4. Attach district-level traffic exposure ────────────────────────────
+    # Join on (distrito, time_slot) only — weather is intentionally excluded
+    # from the denominator (see docstring above).
+    grp = grp.merge(exp_district, on=["distrito", "time_slot"], how="inner")
+    grp = grp[grp["exposure"] > 0]
+
+    # ── 5. Empirical Bayes shrinkage within each (district, travel_type) pair ─
+    results = []
+    for _, sub in grp.groupby(["distrito", "travel_type"], observed=True):
+        n = sub["n_accidents"].values.astype(float)
+        e = sub["exposure"].values.astype(float)
+        rate  = n / e
+        m     = rate.mean()            # mean rate for this district × mode pair
+        if m <= 0:
+            sub = sub.copy()
+            sub["risk_index"] = 1.0
+            results.append(sub)
+            continue
+        E = m * e                      # expected count under mean rate
+        k = max(float(np.median(E)), 1e-6)   # prior strength (Marshall 1991)
+        w = E / (E + k)                # shrinkage weight (0 = shrink fully, 1 = keep raw)
+        shrunk = w * rate + (1 - w) * m
+        sub = sub.copy()
+        sub["risk_index"] = shrunk / m
+        results.append(sub)
+
+    return pd.concat(results, ignore_index=True)[
+        ["distrito", "travel_type", "time_slot", "weather",
+         "n_accidents", "exposure", "risk_index"]
+    ]
 
 
 if __name__ == "__main__":
@@ -258,5 +388,10 @@ if __name__ == "__main__":
     dist_year = build_district_yearly(acc, exposure, global_rate, k)
     dist_year.to_parquet(f"{OUT_DIR}/district_risk_yearly.parquet", index=False)
     print(f"  district-year rows: {len(dist_year)}")
+
+    print("Computing travel risk by mode, time slot and weather...")
+    travel_risk = build_travel_risk(acc, exposure)
+    travel_risk.to_parquet(f"{OUT_DIR}/travel_risk.parquet", index=False)
+    print(f"  travel-risk rows: {len(travel_risk)}")
 
     print("Done.")
