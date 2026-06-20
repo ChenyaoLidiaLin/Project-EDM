@@ -96,24 +96,19 @@ def load_model():
 
 
 @st.cache_data
-def compute_default_districts(sensors_df: pd.DataFrame, min_n: int = 3, n_each: int = 2):
-    """Pre-select highest- and lowest-risk districts so the map is informative
-    on first load."""
+def compute_default_district(sensors_df: pd.DataFrame, min_n: int = 5) -> str:
+    """Return the single highest-risk district (mean risk index across its sensors).
+
+    Used as the shared default for both the map multiselect and the simulator
+    district dropdown so both tabs open on the same, most illustrative example.
+    """
     agg = (
         sensors_df[sensors_df["n_accidents"] >= min_n]
         .groupby("district")["risk_index"].mean()
-        .sort_values()
     )
     if agg.empty:
-        return []
-    lowest  = agg.head(n_each).index.tolist()
-    highest = agg.tail(n_each).index.tolist()
-    ordered, seen = [], set()
-    for d in highest + lowest:
-        if d not in seen:
-            ordered.append(d)
-            seen.add(d)
-    return ordered
+        return sensors_df["district"].dropna().iloc[0]
+    return agg.idxmax()
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +126,7 @@ st.markdown(
 sensors        = load_sensors()
 dist_year      = load_district_yearly()
 districts_list = load_districts()
-default_districts = compute_default_districts(sensors)
+default_district = compute_default_district(sensors)   # single highest-risk district
 
 # ---------------------------------------------------------------------------
 # KPI bar
@@ -194,7 +189,7 @@ SIM_DEFAULTS = {
     "sim_single":       "multiple",
     "sim_weather":      "clear",
     "sim_dow":          "friday",
-    "sim_district":     districts_list[0],
+    "sim_district":     default_district,
 }
 for _k, _v in SIM_DEFAULTS.items():
     st.session_state.setdefault(_k, _v)
@@ -217,7 +212,7 @@ with tab1:
         st.subheader("Filters")
         all_districts_map = sorted(sensors["district"].dropna().unique())
         sel_districts = st.multiselect(
-            "District", all_districts_map, default=default_districts,
+            "District", all_districts_map, default=[default_district],
             format_func=format_district,
         )
         min_acc = st.slider("Minimum recorded accidents at sensor", 1, 50, 3)
