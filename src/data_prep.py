@@ -243,21 +243,62 @@ def build_district_yearly(acc: pd.DataFrame, exposure: pd.DataFrame, m: float, k
     return out
 
 
-def build_travel_risk(acc: pd.DataFrame) -> pd.DataFrame:
-    """Accident counts and empirical Bayes risk index per district / travel
-    mode / time slot / weather combination.
+def build_travel_risk(acc: pd.DataFrame, exposure: pd.DataFrame) -> pd.DataFrame:
+    """Accident rate per district / travel mode / time slot / weather combination,
+    normalized by district-level traffic exposure (same methodology as the sensor
+    risk map and district yearly trends).
 
-    Travel mode is inferred from vehicle type and accident type:
-    - pedestrian knockdown accidents are assigned to the 'pedestrian' mode
-      regardless of the vehicle column (which records the striking vehicle).
-    - All other rows use the vehicle type of the first vehicle in the case.
+    WHY exposure matters here
+    -------------------------
+    The previous version divided accidents by the mean accident count, so the
+    denominator was still an accident-derived number.  That tells you "when do
+    more accidents happen?", not "when do accidents happen more than traffic
+    volume would predict?".  Using the sensor flow as denominator captures the
+    second, harder question: e.g. fewer cars drive in heavy rain, so a raw
+    count of 3 accidents at 3 am in a storm is far more alarming than 3
+    accidents on a clear Friday afternoon.
 
-    The shrinkage is applied within each (district, travel_mode) pair so that
-    the reference rate is that mode's own typical rate in that district, not
-    the city-wide rate. This answers the practical question: given that I am
-    travelling by mode X in district Y, when is it more dangerous than usual?
+    HOW the denominator is built
+    ----------------------------
+    The `exposure` table has one row per (sensor, time_slot, day_of_week) with
+    the mean historical intensidad (veh/h) for that combination.  Each sensor
+    is mapped to the district it belongs to (using the first district label in
+    the accident table).  We then sum over sensors and average over day-of-week
+    to get a single exposure figure per (district, time_slot) — representing
+    the typical total traffic volume in that part of the city during that part
+    of the day.  Weather is *not* used as a grouping key for the denominator:
+    we want to capture "accidents per unit of traffic despite the rain", not
+    "accidents per unit of rainy-day traffic" (which would cancel out the
+    reduced traffic and understate the real risk).
+
+    EMPIRICAL BAYES SHRINKAGE
+    -------------------------
+    Applied within each (district, travel_type) pair, exactly as in
+    _empirical_bayes_index(): each (time_slot, weather) cell is shrunk toward
+    the pair's own mean rate.  Cells with very few accidents converge to 1.0;
+    well-observed cells keep their own estimated rate.
     """
 
+    # ── 1. Map sensor → district; aggregate exposure to district × time_slot ──
+    sensor_to_district = (
+        acc.dropna(subset=["id_sensor_cercano", "distrito"])
+        .groupby("id_sensor_cercano")["distrito"].first()
+    )
+    exp = exposure.copy()
+    exp["distrito"] = exp["id_sensor_cercano"].map(sensor_to_district)
+    # Sum over sensors in the same district; average over day-of-week so that
+    # a district with 5 sensors doesn't look 5× busier than one with 1.
+    exp_district = (
+        exp.dropna(subset=["distrito"])
+        .groupby(["distrito", "time_slot", "day_of_week"], observed=True)["exposure"]
+        .sum()
+        .reset_index()
+        .groupby(["distrito", "time_slot"], observed=True)["exposure"]
+        .mean()
+        .reset_index()
+    )
+
+    # ── 2. Classify travel / road-user type ──────────────────────────────────
     def _travel_type(row):
         a = row["accident_type"]
         v = str(row["tipo_vehiculo"]) if pd.notna(row["tipo_vehiculo"]) else ""
@@ -278,6 +319,7 @@ def build_travel_risk(acc: pd.DataFrame) -> pd.DataFrame:
     acc = acc.copy()
     acc["travel_type"] = acc.apply(_travel_type, axis=1)
 
+    # ── 3. Count accidents per (district × travel_type × time_slot × weather) ─
     grp = (
         acc.dropna(subset=["distrito", "travel_type", "time_slot", "weather"])
         .groupby(["distrito", "travel_type", "time_slot", "weather"], observed=True)
@@ -285,34 +327,36 @@ def build_travel_risk(acc: pd.DataFrame) -> pd.DataFrame:
         .reset_index(name="n_accidents")
     )
 
-    def _eb_within_group(sub: pd.DataFrame) -> pd.DataFrame:
-        """Shrink each cell toward the group mean (district × travel_type)."""
-        m = sub["n_accidents"].mean()
+    # ── 4. Attach district-level traffic exposure ────────────────────────────
+    # Join on (distrito, time_slot) only — weather is intentionally excluded
+    # from the denominator (see docstring above).
+    grp = grp.merge(exp_district, on=["distrito", "time_slot"], how="inner")
+    grp = grp[grp["exposure"] > 0]
+
+    # ── 5. Empirical Bayes shrinkage within each (district, travel_type) pair ─
+    results = []
+    for _, sub in grp.groupby(["distrito", "travel_type"], observed=True):
+        n = sub["n_accidents"].values.astype(float)
+        e = sub["exposure"].values.astype(float)
+        rate  = n / e
+        m     = rate.mean()            # mean rate for this district × mode pair
         if m <= 0:
             sub = sub.copy()
             sub["risk_index"] = 1.0
-            return sub
-        k = max(m, 1.0)          # pseudo-count = group mean (conservative prior)
-        w = m / (m + k)          # shrinkage weight
+            results.append(sub)
+            continue
+        E = m * e                      # expected count under mean rate
+        k = max(float(np.median(E)), 1e-6)   # prior strength (Marshall 1991)
+        w = E / (E + k)                # shrinkage weight (0 = shrink fully, 1 = keep raw)
+        shrunk = w * rate + (1 - w) * m
         sub = sub.copy()
-        shrunk = w * sub["n_accidents"] + (1 - w) * m
         sub["risk_index"] = shrunk / m
-        return sub
+        results.append(sub)
 
-    results = []
-    for (distrito, travel_type), sub in grp.groupby(
-        ["distrito", "travel_type"], observed=True
-    ):
-        processed = _eb_within_group(sub)
-        processed = processed.copy()
-        processed["distrito"]    = distrito
-        processed["travel_type"] = travel_type
-        results.append(processed)
-
-    out = pd.concat(results, ignore_index=True)[
-        ["distrito", "travel_type", "time_slot", "weather", "n_accidents", "risk_index"]
+    return pd.concat(results, ignore_index=True)[
+        ["distrito", "travel_type", "time_slot", "weather",
+         "n_accidents", "exposure", "risk_index"]
     ]
-    return out
 
 
 if __name__ == "__main__":
@@ -346,7 +390,7 @@ if __name__ == "__main__":
     print(f"  district-year rows: {len(dist_year)}")
 
     print("Computing travel risk by mode, time slot and weather...")
-    travel_risk = build_travel_risk(acc)
+    travel_risk = build_travel_risk(acc, exposure)
     travel_risk.to_parquet(f"{OUT_DIR}/travel_risk.parquet", index=False)
     print(f"  travel-risk rows: {len(travel_risk)}")
 

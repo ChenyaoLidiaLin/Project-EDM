@@ -58,6 +58,34 @@ def load_travel_risk():
     return pd.read_parquet(f"{DATA_DIR}/travel_risk.parquet")
 
 
+@st.cache_data
+def load_acc_for_matching():
+    """Load only the columns needed for the simulator → map highlighting.
+
+    Kept separate from load_accidents() so the full parquet isn't read just to
+    populate the sensor-matching overlay — column projection keeps memory low
+    and Streamlit's cache avoids re-reading on every widget interaction.
+    """
+    df = pd.read_parquet(
+        f"{DATA_DIR}/accidents_clean.parquet",
+        columns=["distrito", "weather", "time_slot", "hour",
+                 "id_sensor_cercano", "tipo_vehiculo"],
+    )
+
+    def _vcat(v):
+        if pd.isna(v): return "unknown"
+        v = str(v)
+        if "motocicleta" in v or "ciclomotor" in v: return "motorcycle"
+        if "bicicleta"   in v or "vmu"        in v: return "bike"
+        if "autobus"     in v or "autocar"     in v: return "bus"
+        if "camion"      in v or "furgon"      in v or "tractocamion" in v: return "truck"
+        if "turismo"     in v or "todo terreno" in v: return "car"
+        return "other"
+
+    df["vehicle_cat"] = df["tipo_vehiculo"].apply(_vcat)
+    return df
+
+
 @st.cache_resource
 def load_model():
     pipe       = joblib.load(f"{DATA_DIR}/accident_type_model.joblib")
@@ -238,26 +266,11 @@ with tab1:
     # Build matched sensor IDs from simulator state
     matched_ids = set()
     if highlight_on and not df_map.empty:
-        # Load only the columns needed for matching (avoids full parquet read)
-        acc_match = pd.read_parquet(
-            f"{DATA_DIR}/accidents_clean.parquet",
-            columns=["distrito", "weather", "time_slot", "hour",
-                     "id_sensor_cercano", "tipo_vehiculo"],
-        )
-        def _vcat(v):
-            if pd.isna(v): return "unknown"
-            v = str(v)
-            if "motocicleta" in v or "ciclomotor" in v: return "motorcycle"
-            if "bicicleta" in v or "vmu" in v:          return "bike"
-            if "autobus" in v or "autocar" in v:        return "bus"
-            if "camion" in v or "furgon" in v or "tractocamion" in v: return "truck"
-            if "turismo" in v or "todo terreno" in v:   return "car"
-            return "other"
-        acc_match["vehicle_cat"] = acc_match["tipo_vehiculo"].apply(_vcat)
+        acc_match = load_acc_for_matching()
         hour_tol = 2
         match_mask = (
-            (acc_match["distrito"]    == st.session_state["sim_district"])
-            & (acc_match["weather"]   == st.session_state["sim_weather"])
+            (acc_match["distrito"]      == st.session_state["sim_district"])
+            & (acc_match["weather"]     == st.session_state["sim_weather"])
             & (acc_match["vehicle_cat"] == st.session_state["sim_vehicle"])
             & acc_match["hour"].between(
                 st.session_state["sim_hour"] - hour_tol,
@@ -438,12 +451,22 @@ with tab3:
 
     st.subheader("When is it riskiest to get around by each travel mode?")
     st.markdown(
-        "For a chosen district and travel mode, this compares every time-slot / weather "
-        "combination against **that mode's own typical rate in that district**. "
-        "A value above 1 means accidents are more frequent than usual for that combination; "
-        "below 1, less frequent. The same empirical Bayes shrinkage used in the risk map "
-        "is applied within each district/mode pair, so combinations with very few recorded "
-        "accidents aren't overstated."
+        "For a chosen district and travel mode, this shows which time-slot / weather "
+        "combination produces the highest **accident rate per unit of traffic volume** — "
+        "not just the highest raw accident count. "
+        "The denominator is the mean traffic flow recorded at nearby sensors during each "
+        "time slot (the same exposure proxy used in the risk map), so the index captures "
+        "when accidents happen *more than traffic alone would predict*. "
+        "For example: fewer cars drive in heavy rain, so a raw count of 3 accidents at "
+        "3 am in a storm is far more alarming per unit of flow than 3 accidents on a clear "
+        "Friday afternoon. "
+        "The same Marshall (1991) empirical Bayes shrinkage is applied within each "
+        "district / mode pair, so cells with very few observations are pulled toward 1.0 "
+        "rather than overstated. "
+        "**Note:** the traffic-flow denominator reflects all vehicles at the sensor, not "
+        "only cyclists or pedestrians — there are no mode-specific flow counters in the "
+        "dataset. The index is therefore best read as a *relative comparison across time "
+        "slots and weather* for the same mode and district, not as an absolute rate."
     )
 
     col1, col2 = st.columns(2)
@@ -490,12 +513,16 @@ with tab3:
         best = df_t.sort_values("risk_index", ascending=False).iloc[0]
         st.success(
             f"Highest risk for **{t_mode}** in **{format_district(t_district)}**: "
-            f"**{best['weather']}** during **{best['time_slot']}** — risk index "
-            f"**{best['risk_index']:.2f}** ({int(best['n_accidents'])} accidents recorded)."
+            f"**{best['weather']}** during **{best['time_slot']}** — "
+            f"risk index **{best['risk_index']:.2f}** "
+            f"({int(best['n_accidents'])} accidents · "
+            f"mean traffic exposure {best['exposure']:.0f} veh/h)."
         )
         st.caption(
             f"Based on {int(df_t['n_accidents'].sum())} recorded accidents in total "
-            "for this selection."
+            "for this selection. Risk index = accident rate per unit of sensor-measured "
+            "traffic flow, divided by the mean rate across all time slots for this "
+            "district / mode pair."
         )
 
 
