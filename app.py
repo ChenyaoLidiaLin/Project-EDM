@@ -96,19 +96,23 @@ def load_model():
 
 
 @st.cache_data
-def compute_default_district(sensors_df: pd.DataFrame, min_n: int = 5) -> str:
-    """Return the single highest-risk district (mean risk index across its sensors).
+def compute_default_districts(sensors_df: pd.DataFrame,
+                               min_n: int = 5, top_n: int = 2) -> list:
+    """Return the top-N highest-risk districts (mean risk index across sensors).
 
-    Used as the shared default for both the map multiselect and the simulator
-    district dropdown so both tabs open on the same, most illustrative example.
+    Used as shared defaults for both the map multiselect and the simulator
+    district dropdown so both tabs open on the same illustrative example.
+    Index 0 is the single riskiest district; the rest extend the map selection.
     """
     agg = (
         sensors_df[sensors_df["n_accidents"] >= min_n]
         .groupby("district")["risk_index"].mean()
+        .sort_values(ascending=False)
     )
     if agg.empty:
-        return sensors_df["district"].dropna().iloc[0]
-    return agg.idxmax()
+        fallback = sensors_df["district"].dropna().iloc[0]
+        return [fallback]
+    return agg.head(top_n).index.tolist()
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +130,7 @@ st.markdown(
 sensors        = load_sensors()
 dist_year      = load_district_yearly()
 districts_list = load_districts()
-default_district = compute_default_district(sensors)   # single highest-risk district
+default_districts = compute_default_districts(sensors)   # [riskiest, 2nd-riskiest]
 
 # ---------------------------------------------------------------------------
 # KPI bar
@@ -189,7 +193,7 @@ SIM_DEFAULTS = {
     "sim_single":       "multiple",
     "sim_weather":      "clear",
     "sim_dow":          "friday",
-    "sim_district":     default_district,
+    "sim_district":     default_districts[0],
 }
 for _k, _v in SIM_DEFAULTS.items():
     st.session_state.setdefault(_k, _v)
@@ -212,7 +216,7 @@ with tab1:
         st.subheader("Filters")
         all_districts_map = sorted(sensors["district"].dropna().unique())
         sel_districts = st.multiselect(
-            "District", all_districts_map, default=[default_district],
+            "District", all_districts_map, default=default_districts,
             format_func=format_district,
         )
         min_acc = st.slider("Minimum recorded accidents at sensor", 1, 50, 3)
@@ -318,7 +322,7 @@ with tab1:
                 ring = go.Scattermap(
                     lat=ring_df["lat"], lon=ring_df["lon"],
                     mode="markers",
-                    marker=dict(size=24, color="black", opacity=0.55),
+                    marker=dict(size=36, color="black", opacity=0.55),
                     hoverinfo="skip",
                     name="Matches simulator profile",
                     showlegend=True,
@@ -376,16 +380,6 @@ with tab2:
             ["car", "motorcycle", "bike", "truck", "bus", "other", "unknown"],
             key="sim_vehicle",
         )
-        single = st.radio(
-            "Vehicles involved",
-            ["single", "multiple"],
-            index=1,
-            key="sim_single",
-            horizontal=True,
-        )
-        hour = st.slider("Hour of day", 0, 23, key="sim_hour")
-    with c2:
-        month = st.slider("Month", 1, 12, key="sim_month")
         weather = st.selectbox(
             "Weather",
             ["clear", "cloudy", "light rain", "heavy rain",
@@ -398,11 +392,20 @@ with tab2:
              "friday", "saturday", "sunday"],
             key="sim_dow",
         )
-    with c3:
+    with c2:
         district_sim = st.selectbox(
             "District", districts_list,
             key="sim_district",
             format_func=format_district,
+        )
+        hour = st.slider("Hour of day", 0, 23, key="sim_hour")
+        month = st.slider("Month", 1, 12, key="sim_month")
+    with c3:
+        single = st.radio(
+            "Vehicles involved",
+            ["single", "multiple"],
+            index=1,
+            key="sim_single",
         )
 
     X = pd.DataFrame([{
